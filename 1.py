@@ -77,8 +77,6 @@ parser.add_argument('-b', '--batch-size', type=int, default=64, metavar='N',
                     help='input batch size for training (default: 64)')
 parser.add_argument('-vb', '--validation-batch-size-multiplier', type=int, default=1, metavar='N',
                     help='ratio of validation batch size to training batch size (default: 1)')
-parser.add_argument('--train-full-model', action='store_true', default=False,
-                    help='Training the full model instead of only the classifier.')
 
 # Optimizer parameters
 parser.add_argument('--opt', default='adamw', type=str, metavar='OPTIMIZER',
@@ -197,8 +195,8 @@ parser.add_argument('--split-bn', action='store_true',
                     help='Enable separate BN layers per augmentation split.')
 
 # Model Exponential Moving Average
-parser.add_argument('--no-model-ema', action='store_true', default=False,
-                    help='Disable tracking moving average of model weights')
+parser.add_argument('--model-ema', action='store_true', default=True,
+                    help='Enable tracking moving average of model weights')
 parser.add_argument('--model-ema-force-cpu', action='store_true', default=False,
                     help='Force ema to be tracked on CPU, rank=0 node only. Disables EMA validation.')
 parser.add_argument('--model-ema-decay', type=float, default=0.99996,
@@ -277,7 +275,6 @@ def main():
     args, args_text = _parse_args()
 
     args.prefetcher = not args.no_prefetcher
-    args.model_ema = not args.no_model_ema
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
         args.distributed = int(os.environ['WORLD_SIZE']) > 1
@@ -305,25 +302,11 @@ def main():
         _logger.info('Training with a single process on %d GPUs.' % args.num_gpu)
 
     torch.manual_seed(args.seed + args.rank)
-    if args.img_size != 224 and 'vit' not in args.model:
-        model = create_model(
+
+    model = create_model(
         args.model,
         pretrained=args.pretrained,
-        num_classes=2,
-        drop_rate=args.drop,
-        drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
-        drop_path_rate=args.drop_path,
-        drop_block_rate=args.drop_block,
-        global_pool=args.gp,
-        bn_tf=args.bn_tf,
-        bn_momentum=args.bn_momentum,
-        bn_eps=args.bn_eps,
-        checkpoint_path=args.initial_checkpoint)
-    else:
-        model = create_model(
-        args.model,
-        pretrained=args.pretrained,
-        num_classes=2,
+        num_classes=args.num_classes,
         drop_rate=args.drop,
         drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
         drop_path_rate=args.drop_path,
@@ -334,12 +317,6 @@ def main():
         bn_eps=args.bn_eps,
         checkpoint_path=args.initial_checkpoint,
         img_size=args.img_size)
-
-    # reset classifier
-    if not args.train_full_model:
-        for param in model.parameters():
-            param.requires_grad = False
-    model.reset_classifier(args.num_classes)
 
     if args.local_rank == 0:
         _logger.info('Model %s created, param count: %d' %
@@ -382,11 +359,8 @@ def main():
         model.cuda()
         if args.channels_last:
             model = model.to(memory_format=torch.channels_last)
-            
-    if args.train_full_model:
-        optimizer = create_optimizer(args, model)
-    else:
-        optimizer = create_optimizer(args, model.classifier)
+
+    optimizer = create_optimizer(args, model)
 
     amp_autocast = suppress  # do nothing
     loss_scaler = None
@@ -728,6 +702,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
+    top5_m = AverageMeter()
 
     model.eval()
 
@@ -754,11 +729,12 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 target = target[0:target.size(0):reduce_factor]
 
             loss = loss_fn(output, target)
-            acc1 = accuracy(output, target, topk=(1,))[0]
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
                 acc1 = reduce_tensor(acc1, args.world_size)
+                acc5 = reduce_tensor(acc5, args.world_size)
             else:
                 reduced_loss = loss.data
 
@@ -766,6 +742,7 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
             losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))
+            top5_m.update(acc5.item(), output.size(0))
 
             batch_time_m.update(time.time() - end)
             end = time.time()
@@ -775,11 +752,12 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                     '{0}: [{1:>4d}/{2}]  '
                     'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
                     'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '.format(
+                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
+                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
                         log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m))
+                        loss=losses_m, top1=top1_m, top5=top5_m))
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg)])
+    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
 
     return metrics
 
